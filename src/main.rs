@@ -6,15 +6,20 @@ use serenity::{
     prelude::*,
 };
 
-use rspotify::client::Spotify;
-use rspotify::oauth2::SpotifyClientCredentials;
-use rspotify::oauth2::SpotifyOAuth;
-use rspotify::util::get_token_without_cache;
+use rspotify::{
+    client::Spotify,
+    oauth2::{SpotifyClientCredentials, SpotifyOAuth},
+    util::get_token_without_cache,
+};
 
 use regex::Regex;
 use tokio;
 
-struct Handler;
+struct Handler {
+    spotify_refresh_token: String,
+    // who know why we need this
+    spotify_oauth: SpotifyOAuth,
+}
 
 #[async_trait]
 impl EventHandler for Handler {
@@ -25,17 +30,18 @@ impl EventHandler for Handler {
     // events can be dispatched simultaneously.
     async fn message(&self, ctx: Context, msg: Message) {
         println!("got a message");
-        let re = Regex::new(r".*open.spotify.com/track/([^\s?]*)?.*").unwrap();
-        if let Some(captures) = re.captures(msg.content.as_str()) {
-            // Sending a message can fail, due to a network error, an
-            // authentication error, or lack of permissions to post in the
-            // channel, so log to stdout when some error happens, with a
-            // description of it.
-            println!("{}", captures.get(1).unwrap().as_str());
-            if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
-                println!("Error sending message: {:?}", why);
-            }
-        }
+        self.message_handler(msg).await;
+        // let re = Regex::new(r".*open.spotify.com/track/([^\s?]*)?.*").unwrap();
+        // if let Some(captures) = re.captures(msg.content.as_str()) {
+        //     // Sending a message can fail, due to a network error, an
+        //     // authentication error, or lack of permissions to post in the
+        //     // channel, so log to stdout when some error happens, with a
+        //     // description of it.
+        //     println!("{}", captures.get(1).unwrap().as_str());
+        //     if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
+        //         println!("Error sending message: {:?}", why);
+        //     }
+        // }
     }
 
     // Set a handler to be called on the `ready` event. This is called when a
@@ -84,26 +90,28 @@ async fn spotify_action() {
     print_followed_artists(spotify).await;
 }
 
-async fn message_handler(msg: Message) {
-    let re = Regex::new(r".*open.spotify.com/([^\s]*)").unwrap();
-    if let Some(captures) = re.captures(msg.content.as_str()) {
-        match captures.get(1) {
-            Some(link_msg) => println!("{}", link_msg.as_str()),
-            None => return,
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     // Configure the client with your Discord bot token in the environment.
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
+    let mut oauth = SpotifyOAuth::default()
+        .scope("playlist-modify-public playlist-modify-private playlist-read-private")
+        .build();
+    // let mut refresh_token = String::new();
+    let refresh_token = match env::var("SPOTIFY_REFRESH_TOKEN") {
+        Ok(token) => token,
+        Err(_) => get_refresh_token(&mut oauth).await,
+    };
 
     // Create a new instance of the Client, logging in as a bot. This will
     // automatically prepend your bot token with "Bot ", which is a requirement
     // by Discord for bot users.
+    println!("{}", refresh_token);
     let mut client = Client::builder(&token)
-        .event_handler(Handler)
+        .event_handler(Handler {
+            spotify_refresh_token: refresh_token,
+            spotify_oauth: oauth,
+        })
         .await
         .expect("Err creating client");
 
@@ -158,12 +166,28 @@ async fn print_followed_artists(spotify: Spotify) {
     }
 }
 
-async fn add_song_to_playlist(spotify: Spotify, song: &str) {
-    let user = spotify.current_user().await.unwrap();
-    spotify.user_playlist_add_tracks(
-        &user.id,
-        "6Bq10yvtBE5lCZi1Fgx6ol",
-        &[song.to_string()],
-        None,
-    );
+impl Handler {
+    async fn add_song_to_playlist(&self, song: &str) {
+        let spotify =
+            client_from_refresh_token(&self.spotify_oauth, &self.spotify_refresh_token).await;
+        let user = spotify.current_user().await.unwrap();
+        spotify
+            .user_playlist_add_tracks(
+                &user.id,
+                "6Bq10yvtBE5lCZi1Fgx6ol",
+                &[song.to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    async fn message_handler(&self, msg: Message) {
+        let re = Regex::new(r".*open.spotify.com/track/([^\s?]*)?.*").unwrap();
+        if let Some(captures) = re.captures(msg.content.as_str()) {
+            match captures.get(1) {
+                Some(link_msg) => self.add_song_to_playlist(link_msg.as_str()).await,
+                None => return,
+            }
+        }
+    }
 }
