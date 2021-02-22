@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::HashMap, env};
 
 use serenity::{
     async_trait,
@@ -17,8 +17,9 @@ use tokio;
 
 struct Handler {
     spotify_refresh_token: String,
-    // who know why we need this
+    // who knows why we need this
     spotify_oauth: SpotifyOAuth,
+    map: HashMap<String, bool>,
 }
 
 #[async_trait]
@@ -31,41 +32,35 @@ impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         println!("got a message");
         self.message_handler(msg).await;
-        // let re = Regex::new(r".*open.spotify.com/track/([^\s?]*)?.*").unwrap();
-        // if let Some(captures) = re.captures(msg.content.as_str()) {
-        //     // Sending a message can fail, due to a network error, an
-        //     // authentication error, or lack of permissions to post in the
-        //     // channel, so log to stdout when some error happens, with a
-        //     // description of it.
-        //     println!("{}", captures.get(1).unwrap().as_str());
-        //     if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
-        //         println!("Error sending message: {:?}", why);
-        //     }
-        // }
     }
 
-    // Set a handler to be called on the `ready` event. This is called when a
-    // shard is booted, and a READY payload is sent by Discord. This payload
-    // contains data like the current user's guild Ids, current user data,
-    // private channels, and more.
-    //
-    // In this case, just print what the current user's username is.
     async fn ready(&self, ctx: Context, ready: Ready) {
-        // let chan = ctx.http.get_channel(704582327384145962).await.unwrap();
-        // chan.id().messages(http, builder)
         let channel_id = ChannelId(702062981608898614);
-        // let last_msg = MessageId(812209739417124884);
 
         let messages = channel_id
             .messages(&ctx.http, |ret| ret.limit(1))
             .await
             .unwrap();
-        for msg in messages {
-            println!("{}", msg.content)
+        let last_msg = &messages[0];
+        loop {
+            let messages = channel_id
+                .messages(&ctx.http, |ret| ret.before(last_msg).limit(100))
+                .await
+                .unwrap();
+
+            let msg_len = messages.len();
+            for message in messages {
+                self.message_handler(message).await;
+            }
+            if msg_len < 100 {
+                break;
+            }
         }
+
         println!("{} is connected!", ready.user.name);
     }
 }
+
 async fn spotify_action() {
     // The default credentials from the `.env` file will be used by default.
     let mut oauth = SpotifyOAuth::default()
@@ -103,6 +98,36 @@ async fn main() {
         Err(_) => get_refresh_token(&mut oauth).await,
     };
 
+    let mut song_map = HashMap::new();
+    let spotify = client_from_refresh_token(&oauth, refresh_token.as_str()).await;
+    let user = spotify.current_user().await.unwrap();
+    let mut playlist_id = String::from("6Bq10yvtBE5lCZi1Fgx6ol");
+    // let why = &mut *playlist_id;
+    let playlist = spotify
+        .user_playlist(
+            user.id.as_str(),
+            Some(playlist_id.as_mut_str()),
+            Some("fields=tracks.items(id)"),
+            None,
+        )
+        .await
+        .unwrap();
+    println!("{:#?}", playlist.tracks.next);
+
+    for track in playlist.tracks.items {
+        // println!("{:#?}", track);
+        let unwrapped_track = track.track.unwrap();
+        println!("{:#?}", unwrapped_track);
+
+        match unwrapped_track.id {
+            Some(track_id) => {
+                // println!("{}", track_name);
+                song_map.insert(track_id, true);
+            }
+            _ => {}
+        };
+    }
+    println!("{:#?}", song_map);
     // Create a new instance of the Client, logging in as a bot. This will
     // automatically prepend your bot token with "Bot ", which is a requirement
     // by Discord for bot users.
@@ -111,6 +136,7 @@ async fn main() {
         .event_handler(Handler {
             spotify_refresh_token: refresh_token,
             spotify_oauth: oauth,
+            map: song_map,
         })
         .await
         .expect("Err creating client");
@@ -119,6 +145,7 @@ async fn main() {
     //
     // Shards will automatically attempt to reconnect, and will perform
     // exponential backoff until it reconnects.
+    // client.
     if let Err(why) = client.start().await {
         println!("Client error: {:?}", why);
     }
@@ -185,7 +212,12 @@ impl Handler {
         let re = Regex::new(r".*open.spotify.com/track/([^\s?]*)?.*").unwrap();
         if let Some(captures) = re.captures(msg.content.as_str()) {
             match captures.get(1) {
-                Some(link_msg) => self.add_song_to_playlist(link_msg.as_str()).await,
+                Some(link_msg) => {
+                    // if it's None, we haven't added the song to the playlist
+                    if let None = self.map.get(link_msg.as_str()) {
+                        self.add_song_to_playlist(link_msg.as_str()).await
+                    }
+                }
                 None => return,
             }
         }
