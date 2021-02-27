@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, env};
+use std::{collections::HashMap, env};
 
 use serenity::{
     async_trait,
@@ -26,56 +26,36 @@ struct Handler {
     spotify_oauth: SpotifyOAuth,
     map: RwLock<HashMap<String, bool>>,
     spotify_playlist: String,
+    channel_id: u64,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
-    // Set a handler for the `message` event - so that whenever a new message
-    // is received - the closure (or function) passed will be called.
-    //
-    // Event handlers are dispatched through a threadpool, and so multiple
-    // events can be dispatched simultaneously.
     async fn message(&self, _: Context, msg: Message) {
-        // println!("got a message");
-        self.message_handler(msg).await;
+        // if this isn't the case we'll consume spotify links from ANY channel, which maybe isn't bad?
+        if msg.channel_id.as_u64().eq(&self.channel_id) {
+            self.message_handler(msg).await;
+        }
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
-        let channel_id = ChannelId(702062981608898614);
+        let channel_id = ChannelId(self.channel_id);
+        let mut stack: Vec<Message> = Vec::new();
         let mut msgs = MessagesIter::<Http>::stream(&ctx, channel_id).boxed();
         while let Some(msg) = msgs.next().await {
             match msg {
                 Ok(m) => {
-                    self.message_handler(m).await;
+                    stack.push(m);
                 }
                 Err(err) => {
                     println!("{}", err);
                 }
             }
         }
-
-        // This attempts to insert all messages into the playlist
-        // let messages = channel_id
-        //     .messages(&ctx.http, |ret| ret.limit(1))
-        //     .await
-        //     .unwrap();
-        // let mut last_msg = &messages[0];
-        // loop {
-        //     let messages = channel_id
-        //         .messages(&ctx.http, |ret| ret.before(last_msg).limit(2))
-        //         .await
-        //         .unwrap();
-
-        //     let msg_len = messages.len();
-        //     for message in messages {
-        //         println!("{}", message.content);
-        //         self.message_handler(message).await;
-        //         last_msg = &message.clone();
-        //     }
-        //     if msg_len < 2 {
-        //         break;
-        //     }
-        // }
+        // MessagesIter streams from newest to oldest, which doesn't really make sense for a playlist
+        while let Some(msg) = stack.pop() {
+            self.message_handler(msg).await;
+        }
 
         println!("{} is connected!", ready.user.name);
     }
@@ -83,24 +63,28 @@ impl EventHandler for Handler {
 
 #[tokio::main]
 async fn main() {
-    // Configure the client with your Discord bot token in the environment.
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
     let mut oauth = SpotifyOAuth::default()
         .scope("playlist-modify-public playlist-modify-private playlist-read-private")
         .build();
-    // let mut refresh_token = String::new();
+
     let refresh_token = match env::var("SPOTIFY_REFRESH_TOKEN") {
         Ok(token) => token,
         Err(_) => get_refresh_token(&mut oauth).await,
     };
-    println!("{}", refresh_token);
+
     let mut playlist_id =
         env::var("SPOTIFY_PLAYLIST").expect("expected SPOTIFY_PLAYLIST to be set");
+    let channel_id = env::var("DISCORD_CHANNEL_ID")
+        .expect("need channel id")
+        .parse::<u64>()
+        .expect("channel id not int");
 
     let mut song_map = HashMap::new();
     let spotify = client_from_refresh_token(&oauth, refresh_token.as_str()).await;
+    // There's a lot of unwrap(), but this is just in the init code
     let user = spotify.current_user().await.unwrap();
-    // let why = &mut *playlist_id;
+
     let playlist = spotify
         .user_playlist(
             user.id.as_str(),
@@ -110,12 +94,9 @@ async fn main() {
         )
         .await
         .unwrap();
-    println!("PLAYLIST {:#?}", playlist);
 
     for track in playlist.tracks.items {
-        println!("{:#?}", track);
         let unwrapped_track = track.track.unwrap();
-        println!("unwrapped: {:#?}", unwrapped_track);
 
         match unwrapped_track.id {
             Some(track_id) => {
@@ -125,9 +106,6 @@ async fn main() {
             _ => {}
         };
     }
-    println!("SONG MAP");
-    println!("{:#?}", song_map);
-    println!("FBAT ZNC");
 
     let mut client = Client::builder(&token)
         .event_handler(Handler {
@@ -135,6 +113,7 @@ async fn main() {
             spotify_oauth: oauth,
             map: RwLock::new(song_map),
             spotify_playlist: playlist_id,
+            channel_id,
         })
         .await
         .expect("Err creating client");
@@ -182,12 +161,12 @@ impl Handler {
             .unwrap();
     }
     async fn message_handler(&self, msg: Message) {
+        // This unwrap shouldn't happen, since it's just compiling the regex
         let re = Regex::new(r".*open.spotify.com/track/([^\s?]*)?.*").unwrap();
         if let Some(captures) = re.captures(msg.content.as_str()) {
             match captures.get(1) {
                 Some(link_msg) => {
-                    // if it's None, we haven't added the song to the playlist
-                    println!("{}", link_msg.as_str());
+                    // if it's false, we haven't added the song to the playlist
                     let in_map = match self.map.read().await.get(link_msg.as_str()) {
                         Some(_) => true,
                         None => false,
