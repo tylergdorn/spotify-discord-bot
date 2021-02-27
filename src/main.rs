@@ -1,8 +1,14 @@
-use std::{collections::HashMap, env};
+use std::{cell::RefCell, collections::HashMap, env};
 
 use serenity::{
     async_trait,
-    model::{channel::Message, gateway::Ready, id::ChannelId, id::MessageId},
+    futures::StreamExt,
+    http::Http,
+    model::{
+        channel::{Message, MessagesIter},
+        gateway::Ready,
+        id::ChannelId,
+    },
     prelude::*,
 };
 
@@ -17,9 +23,9 @@ use tokio;
 
 struct Handler {
     spotify_refresh_token: String,
-    // who knows why we need this
     spotify_oauth: SpotifyOAuth,
-    map: HashMap<String, bool>,
+    map: RwLock<HashMap<String, bool>>,
+    spotify_playlist: String,
 }
 
 #[async_trait]
@@ -29,60 +35,50 @@ impl EventHandler for Handler {
     //
     // Event handlers are dispatched through a threadpool, and so multiple
     // events can be dispatched simultaneously.
-    async fn message(&self, ctx: Context, msg: Message) {
-        println!("got a message");
+    async fn message(&self, _: Context, msg: Message) {
+        // println!("got a message");
         self.message_handler(msg).await;
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         let channel_id = ChannelId(702062981608898614);
-
-        let messages = channel_id
-            .messages(&ctx.http, |ret| ret.limit(1))
-            .await
-            .unwrap();
-        let last_msg = &messages[0];
-        loop {
-            let messages = channel_id
-                .messages(&ctx.http, |ret| ret.before(last_msg).limit(100))
-                .await
-                .unwrap();
-
-            let msg_len = messages.len();
-            for message in messages {
-                self.message_handler(message).await;
-            }
-            if msg_len < 100 {
-                break;
+        let mut msgs = MessagesIter::<Http>::stream(&ctx, channel_id).boxed();
+        while let Some(msg) = msgs.next().await {
+            match msg {
+                Ok(m) => {
+                    self.message_handler(m).await;
+                }
+                Err(err) => {
+                    println!("{}", err);
+                }
             }
         }
 
+        // This attempts to insert all messages into the playlist
+        // let messages = channel_id
+        //     .messages(&ctx.http, |ret| ret.limit(1))
+        //     .await
+        //     .unwrap();
+        // let mut last_msg = &messages[0];
+        // loop {
+        //     let messages = channel_id
+        //         .messages(&ctx.http, |ret| ret.before(last_msg).limit(2))
+        //         .await
+        //         .unwrap();
+
+        //     let msg_len = messages.len();
+        //     for message in messages {
+        //         println!("{}", message.content);
+        //         self.message_handler(message).await;
+        //         last_msg = &message.clone();
+        //     }
+        //     if msg_len < 2 {
+        //         break;
+        //     }
+        // }
+
         println!("{} is connected!", ready.user.name);
     }
-}
-
-async fn spotify_action() {
-    // The default credentials from the `.env` file will be used by default.
-    let mut oauth = SpotifyOAuth::default()
-        .scope("user-follow-read user-follow-modify")
-        .build();
-
-    // In the first session of the application we only authenticate and obtain
-    // the refresh token.
-    println!(">>> Session one, obtaining refresh token:");
-    let refresh_token = get_refresh_token(&mut oauth).await;
-
-    // At a different time, the refresh token can be used to refresh an access
-    // token directly and run requests:
-    println!(">>> Session two, running some requests:");
-    let spotify = client_from_refresh_token(&mut oauth, &refresh_token).await;
-    print_followed_artists(spotify).await;
-
-    // This process can now be repeated multiple times by using only the
-    // refresh token that was obtained at the beginning.
-    println!(">>> Session three, running some requests:");
-    let spotify = client_from_refresh_token(&mut oauth, &refresh_token).await;
-    print_followed_artists(spotify).await;
 }
 
 #[tokio::main]
@@ -97,11 +93,13 @@ async fn main() {
         Ok(token) => token,
         Err(_) => get_refresh_token(&mut oauth).await,
     };
+    println!("{}", refresh_token);
+    let mut playlist_id =
+        env::var("SPOTIFY_PLAYLIST").expect("expected SPOTIFY_PLAYLIST to be set");
 
     let mut song_map = HashMap::new();
     let spotify = client_from_refresh_token(&oauth, refresh_token.as_str()).await;
     let user = spotify.current_user().await.unwrap();
-    let mut playlist_id = String::from("6Bq10yvtBE5lCZi1Fgx6ol");
     // let why = &mut *playlist_id;
     let playlist = spotify
         .user_playlist(
@@ -112,40 +110,36 @@ async fn main() {
         )
         .await
         .unwrap();
-    println!("{:#?}", playlist.tracks.next);
+    println!("PLAYLIST {:#?}", playlist);
 
     for track in playlist.tracks.items {
-        // println!("{:#?}", track);
+        println!("{:#?}", track);
         let unwrapped_track = track.track.unwrap();
-        println!("{:#?}", unwrapped_track);
+        println!("unwrapped: {:#?}", unwrapped_track);
 
         match unwrapped_track.id {
             Some(track_id) => {
-                // println!("{}", track_name);
+                println!("{}", track_id);
                 song_map.insert(track_id, true);
             }
             _ => {}
         };
     }
+    println!("SONG MAP");
     println!("{:#?}", song_map);
-    // Create a new instance of the Client, logging in as a bot. This will
-    // automatically prepend your bot token with "Bot ", which is a requirement
-    // by Discord for bot users.
-    println!("{}", refresh_token);
+    println!("FBAT ZNC");
+
     let mut client = Client::builder(&token)
         .event_handler(Handler {
             spotify_refresh_token: refresh_token,
             spotify_oauth: oauth,
-            map: song_map,
+            map: RwLock::new(song_map),
+            spotify_playlist: playlist_id,
         })
         .await
         .expect("Err creating client");
 
-    // Finally, start a single shard, and start listening to events.
-    //
-    // Shards will automatically attempt to reconnect, and will perform
-    // exponential backoff until it reconnects.
-    // client.
+    println!("Spotify playlist initialized");
     if let Err(why) = client.start().await {
         println!("Client error: {:?}", why);
     }
@@ -177,34 +171,13 @@ async fn client_from_refresh_token(oauth: &SpotifyOAuth, refresh_token: &str) ->
         .build()
 }
 
-// Sample request that will follow some artists, print the user's
-// followed artists, and then unfollow the artists.
-async fn print_followed_artists(spotify: Spotify) {
-    let followed = spotify
-        .current_user_followed_artists(None, None)
-        .await
-        .expect("couldn't get user followed artists");
-    // println!(
-    //     "User currently follows at least {} artists.",
-    //     followed.artists.items.len()
-    // );
-    for artist in followed.artists.items.iter() {
-        println!("following {}", artist.name)
-    }
-}
-
 impl Handler {
     async fn add_song_to_playlist(&self, song: &str) {
         let spotify =
             client_from_refresh_token(&self.spotify_oauth, &self.spotify_refresh_token).await;
         let user = spotify.current_user().await.unwrap();
         spotify
-            .user_playlist_add_tracks(
-                &user.id,
-                "6Bq10yvtBE5lCZi1Fgx6ol",
-                &[song.to_string()],
-                None,
-            )
+            .user_playlist_add_tracks(&user.id, &self.spotify_playlist, &[song.to_string()], None)
             .await
             .unwrap();
     }
@@ -214,8 +187,18 @@ impl Handler {
             match captures.get(1) {
                 Some(link_msg) => {
                     // if it's None, we haven't added the song to the playlist
-                    if let None = self.map.get(link_msg.as_str()) {
-                        self.add_song_to_playlist(link_msg.as_str()).await
+                    println!("{}", link_msg.as_str());
+                    let in_map = match self.map.read().await.get(link_msg.as_str()) {
+                        Some(_) => true,
+                        None => false,
+                    };
+
+                    if !in_map {
+                        self.map
+                            .write()
+                            .await
+                            .insert(link_msg.as_str().to_string(), true);
+                        self.add_song_to_playlist(link_msg.as_str()).await;
                     }
                 }
                 None => return,
